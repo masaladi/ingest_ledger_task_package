@@ -1,0 +1,6 @@
+# 内部工作产物不入库
+.workbuddy/
+__pycache__/
+*.pyc
+logs.jsonl
+*.stale
