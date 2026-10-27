@@ -45,32 +45,18 @@ import json as _sj                 # 序列化用（ujson.dumps 不支持 separa
 
 BASE = os.environ["BASE"]
 
-# 防篡改真值基线：镜像构建期冻结的 journal 只读副本与摘要（随镜像层分发的
-# 构建产物）。真值重放一律以"该基线 + 评测端追加（影子流）"为准，与服务/考生
-# 可写的 live journal 解耦，杜绝"改写 journal 让服务自证正确"的环形作弊。
+# 防篡改真值锚点（跨界原则：verifier 侧材料不进入被测镜像）：
+# 镜像内不落地任何真值基线副本或摘要文件；锚点是烧录进本判分脚本的 journal
+# 构建期摘要常量（gen_journal 固定种子，跨平台构建一致）。评测开始时对
+# live journal 做摘要校验，通过后立即复制为本次评测专属的随机路径影子真值流
+# （0600），此后真值只重放影子流，与服务/考生可写的 live journal 解耦，
+# 杜绝"改写 journal 让服务自证正确"的环形作弊。
 # 影子流路径由评测入口随机生成并经环境变量传入（SHADOW_PATH），每次评测不同。
-PRISTINE_PATH = "/opt/ingest-ledger/.journal.pristine"
-DIGEST_PATH = "/opt/ingest-ledger/.journal.sha256"
 SHADOW_PATH = os.environ["SHADOW_PATH"]
-SHADOW_ON = False                # 影子真值是否启用（冻结基线就绪时为 True）
+SHADOW_ON = False                # 影子真值是否启用（摘要校验通过后为 True）
 TRUTH_PATH = None                # 真值锚点：影子真值流（由 ensure_shadow 决定）
-# 烧录进判分脚本的 journal 构建期摘要（gen_journal 固定种子，跨平台构建一致）。
-# 基线文件与摘要文件即使被同时改写，也会与烧录值冲突而被拦截。
 EXPECTED_JOURNAL_SHA256 = "7aae648c8c389f6b5783eadb16192235f39cc3808d4057ea8e6fbd8d2835bdbc"
 EXPECTED_JOURNAL_SIZE = 636039414       # 构建期基线字节数（追加使文件变长，历史前缀不变）
-
-
-def verify_pristine():
-    """校验防篡改基线摘要；基线缺失或摘要不符时抛异常。"""
-    import hashlib
-    with open(DIGEST_PATH) as f:
-        want = f.read().split()[0]
-    h = hashlib.sha256()
-    with open(PRISTINE_PATH, "rb") as f:
-        for chunk in iter(lambda: f.read(8 << 20), b""):
-            h.update(chunk)
-    if h.hexdigest() != want:
-        raise RuntimeError("pristine journal digest mismatch (baseline tampered)")
 
 
 def _digest_of(path, limit=None):
@@ -91,25 +77,31 @@ def _digest_of(path, limit=None):
 
 
 def ensure_shadow():
-    """真值锚点解析（防篡改，无降级路径）：
+    """真值锚点解析（防篡改，无降级路径，verifier 材料零进入镜像）：
 
-    构建期冻结基线（.journal.pristine + .journal.sha256，随镜像层分发的构建
-    产物）在且摘要（文件摘要与烧录常量双重）相符 → 复制为本次评测专属的
-    随机路径影子真值流（0600），此后真值只重放影子流。
-    基线缺失、只存其一或任一摘要不符 → 一律评测硬失败。真值永不回退到考生
-    可写的 live journal，不存在"改写数据文件同时充当仿真与真值"的通道。"""
+    1) live journal 与烧录摘要逐字节一致（评测开始时的正常形态）
+       → 复制为本次评测专属的随机路径影子真值流（0600）；
+    2) live journal 长于基线（评测端前序追加）→ 历史前缀必须与烧录摘要一致；
+    3) 短于基线或任一摘要不符 → 数据被改写，评测硬失败。
+    真值永不信任与烧录摘要不符的数据：篡改只能让评测失败，不能换取得分
+    （fail-closed）。不存在降级路径，无任何"改写数据文件同时充当仿真与真值"
+    的通道。"""
     global SHADOW_ON, TRUTH_PATH
     import shutil
-    if not (os.path.exists(PRISTINE_PATH) and os.path.exists(DIGEST_PATH)):
+    size = os.stat(JOURNAL).st_size
+    if size < EXPECTED_JOURNAL_SIZE:
         raise RuntimeError(
-            "frozen truth baseline missing (build-time artifacts "
-            ".journal.pristine / .journal.sha256 not both present): "
-            "evaluation environment broken (hard fail)")
-    with open(DIGEST_PATH) as f:
-        want = f.read().split()[0]
-    if _digest_of(PRISTINE_PATH) != want or want != EXPECTED_JOURNAL_SHA256:
-        raise RuntimeError(
-            "pristine baseline digest mismatch: baseline tampered (hard fail)")
+            "journal shorter than frozen baseline (%d < %d): data tampered "
+            "(hard fail)" % (size, EXPECTED_JOURNAL_SIZE))
+    if size == EXPECTED_JOURNAL_SIZE:
+        if _digest_of(JOURNAL) != EXPECTED_JOURNAL_SHA256:
+            raise RuntimeError(
+                "journal digest mismatch: data tampered (hard fail)")
+    else:
+        # 仅允许评测端自身的追加使文件变长：历史前缀必须与烧录摘要一致
+        if _digest_of(JOURNAL, EXPECTED_JOURNAL_SIZE) != EXPECTED_JOURNAL_SHA256:
+            raise RuntimeError(
+                "journal prefix digest mismatch: data tampered (hard fail)")
     if os.path.exists(SHADOW_PATH):
         # 影子流已存在（同一次评测的前序大项创建）：前缀必须与烧录摘要
         # 一致（基线 + 追加），预置伪造文件在此被拦截
@@ -118,7 +110,7 @@ def ensure_shadow():
             raise RuntimeError(
                 "shadow truth stream prefix mismatch (hard fail)")
     else:
-        shutil.copyfile(PRISTINE_PATH, SHADOW_PATH)
+        shutil.copyfile(JOURNAL, SHADOW_PATH)
         os.chmod(SHADOW_PATH, 0o600)
     SHADOW_ON = True
     TRUTH_PATH = SHADOW_PATH
@@ -715,8 +707,8 @@ if warm == "FAIL":
 elif float(warm) > walib.WARMUP_SLA:
     fails.append("2a first request %.2fs > %.1fs SLA (full replay of ~9.5M lines "
                  "must fit the 20s budget)" % (float(warm), walib.WARMUP_SLA))
-# 防篡改基线：真值以容器镜像构建期冻结的只读副本 + 评测端追加（影子流）重放，
-# 与 live journal 解耦；基线缺失或摘要不符即评测硬失败（见 walib.ensure_shadow）
+# 防篡改真值：评测开始时经摘要校验的 live journal 快照（影子流）+ 评测端追加；
+# 数据改写在摘要校验处硬失败（见 walib.ensure_shadow）
 truth_path = walib.ensure_shadow()
 t0 = time.monotonic()
 truth = walib.Truth(truth_path)
