@@ -26,6 +26,7 @@ REQUIRED_FILES = [
     "environment/squatter.py",
     "solution/solve.sh",
     "tests/test.sh",
+    "scripts/selfcheck.sh",
 ]
 
 # R1 硬门槛触发模式：任何提交包文件中不得出现
@@ -45,7 +46,7 @@ MUST_ALIGN = {
 
 # 不允许出现的过期数字与旧任务残留（历次迭代清查）
 STALE_NUMBERS = ["9090", "9310", "log-aggregator", "telemetry-svc", "855 万",
-                 "880 MB", "900 万行", "970 万行", "24 秒"]
+                 "880 MB", "900 万行", "970 万行", "24 秒", "24s"]
 
 
 def read(path):

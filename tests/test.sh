@@ -39,6 +39,26 @@ except ImportError:
 import json as _sj                 # 序列化用（ujson.dumps 不支持 separators）
 
 BASE = os.environ["BASE"]
+
+# 防篡改真值基线：容器启动时由现场进程冻结的 journal 只读副本与摘要。
+# 真值重放一律以"该基线 + 评测端追加（影子流）"为准，与服务/考生可写的
+# live journal 解耦，杜绝"改写 journal 让服务自证正确"的环形作弊。
+PRISTINE_PATH = "/opt/ingest-ledger/.journal.pristine"
+DIGEST_PATH = "/opt/ingest-ledger/.journal.sha256"
+SHADOW_PATH = "/tmp/truth_journal.jsonl"
+
+
+def verify_pristine():
+    """校验防篡改基线摘要；基线缺失或被改写时抛异常（评测必须拒绝）。"""
+    import hashlib
+    with open(DIGEST_PATH) as f:
+        want = f.read().split()[0]
+    h = hashlib.sha256()
+    with open(PRISTINE_PATH, "rb") as f:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != want:
+        raise RuntimeError("pristine journal digest mismatch (baseline tampered)")
 JOURNAL = os.environ["JOURNAL"]
 
 APPEND_SLA = 1.5     # 常规变更（追加事务块）后的首个请求
@@ -51,10 +71,23 @@ HDR = "X-Ledger-Status"
 class Writer(object):
     """追加行时持排他锁并 fsync；seq 沿用文件中已接受的最大 seq 继续分配。"""
 
-    def __init__(self, path, seq):
+    def __init__(self, path, seq, shadow=None):
         self.path = path
         self.seq = seq
+        self.shadow = shadow       # 影子真值流：评测端追加同步落一份，真值不读 live journal
         self.history = []          # 评测期间追加过的全部行（压缩重写时复用）
+
+    def _shadow_append(self, payload):
+        if not self.shadow:
+            return
+        with open(self.shadow, "ab") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
     def emit(self, objs):
         lines = []
@@ -66,27 +99,31 @@ class Writer(object):
                 o["seq"] = self.seq
             lines.append(_sj.dumps(o, separators=(",", ":")))
             self.history.append(lines[-1])
+        payload = ("\n".join(lines) + "\n").encode("utf-8")
         with open(self.path, "r+b") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 f.seek(0, 2)
-                f.write(("\n".join(lines) + "\n").encode("utf-8"))
+                f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._shadow_append(payload)
 
     def emit_raw(self, raw_lines):
         """写入无法通过 JSON 解析或字段非法的行（不占用 seq）。"""
+        payload = ("\n".join(raw_lines) + "\n").encode("utf-8")
         with open(self.path, "r+b") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 f.seek(0, 2)
-                f.write(("\n".join(raw_lines) + "\n").encode("utf-8"))
+                f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        self._shadow_append(payload)
 
     def compact(self, snapshot, include_history=True):
         """压缩重写：以检查点为基线整体替换文件（原子替换，新 inode）。
@@ -108,6 +145,8 @@ class Writer(object):
         os.chmod(tmp, 0o644)
         os.replace(tmp, self.path)
         self.history = []
+        # 影子真值流不受压缩影响：真值 = 基线 + 评测端全部追加的完整重放，
+        # 与 live journal 的压缩形态在语义上必须等价——这正是 3b 要考的不变式。
 
 
 # ---------------- 真值状态机（独立重放，不信任服务） ----------------
@@ -300,8 +339,9 @@ def cmp_summary(got, want, label, fails):
 
 def cmp_key(got, want, label, fails):
     for k in ("name", "balance", "last_seq"):
-        if got.get(k) != want[k]:
-            fails.append("%s: %s=%r want %r" % (label, k, got.get(k), want[k]))
+        gv = got.get(k)
+        if type(gv) is not type(want[k]) or gv != want[k]:
+            fails.append("%s: %s=%r want %r" % (label, k, gv, want[k]))
 PYLIB
 
 # 等待被测服务就绪（最多 120 秒：服务启动时可能要做首次全量重放）
@@ -449,13 +489,18 @@ for method in ("POST", "PUT", "DELETE", "OPTIONS", "PATCH"):
         req = urllib.request.Request(BASE + "/api/v1/ledger", data=b"", method=method)
         resp = urllib.request.urlopen(req, timeout=10)
         code, allow = resp.getcode(), resp.headers.get("Allow")
+        status = resp.headers.get(HDR)
     except Exception as e:
         code = getattr(e, "code", -1)
         allow = e.headers.get("Allow") if hasattr(e, "headers") else None
+        status = e.headers.get(HDR) if hasattr(e, "headers") else None
     if code != 405:
         fails.append("%s /api/v1/ledger status=%s (want 405)" % (method, code))
-    elif "GET" not in (allow or "") or "HEAD" not in (allow or ""):
-        fails.append("%s 405 Allow=%r (want GET, HEAD)" % (method, allow))
+    else:
+        if "GET" not in (allow or "") or "HEAD" not in (allow or ""):
+            fails.append("%s 405 Allow=%r (want GET, HEAD)" % (method, allow))
+        if status != "Verified":
+            fails.append("%s 405 %s=%r (want Verified)" % (method, HDR, status))
 
 # --- 运维真实性：端口归属 + 运行身份 + venv ---
 def listen_rows(port=9410):
@@ -554,7 +599,7 @@ fails = []
 def ledger_now(timeout=10):
     return walib.get_json("/api/v1/ledger", timeout=timeout)[0]
 
-# ---------- 2a. 基线：全量重放必须与独立真值完全一致，且首次请求不超 24s ----------
+# ---------- 2a. 基线：全量重放必须与独立真值完全一致，且首次请求不超 20s ----------
 try:
     with open("/tmp/warmup_elapsed.txt") as f:
         warm = f.read().strip()
@@ -565,13 +610,17 @@ if warm == "FAIL":
 elif float(warm) > walib.WARMUP_SLA:
     fails.append("2a first request %.2fs > %.1fs SLA (full replay of ~9.5M lines "
                  "must fit the 20s budget)" % (float(warm), walib.WARMUP_SLA))
+# 防篡改基线：真值从容器启动时冻结的只读副本重放，与 live journal 解耦
+walib.verify_pristine()
+import shutil
+shutil.copyfile(walib.PRISTINE_PATH, walib.SHADOW_PATH)
 t0 = time.monotonic()
-truth = walib.Truth(JOURNAL)
+truth = walib.Truth(walib.SHADOW_PATH)
 truth.full()
 print("[truth] baseline replay %.1fs, records=%d txns=%d keys=%d"
       % (time.monotonic() - t0, truth.records, truth.txns, len(truth.bal)),
       file=sys.stderr)
-writer = walib.Writer(JOURNAL, truth.last_seq)
+writer = walib.Writer(JOURNAL, truth.last_seq, shadow=walib.SHADOW_PATH)
 want = truth.summary()
 try:
     got = ledger_now(timeout=walib.WARMUP_SLA)
@@ -705,9 +754,9 @@ def ledger(timeout=30):
     return walib.get_json("/api/v1/ledger", timeout=timeout)
 
 # ---------- 3a. 增量 SLA：追加事务块后首个请求 <= 1.5s 且值正确 ----------
-truth = walib.Truth(JOURNAL)
+truth = walib.Truth(walib.SHADOW_PATH)
 truth.full()
-writer = walib.Writer(JOURNAL, truth.last_seq)
+writer = walib.Writer(JOURNAL, truth.last_seq, shadow=walib.SHADOW_PATH)
 tx = 724100
 puts = [("acct-%04d" % (i % 5000), (i * 53) % 30000 - 15000) for i in range(5000)]
 writer.emit(walib.txn_block(tx, puts))
@@ -776,11 +825,19 @@ def long_writer():
             f.write(body)
             f.flush()
             os.fsync(f.fileno())
+            with open(walib.SHADOW_PATH, "ab") as sf:
+                sf.write(body)
+                sf.flush()
+                os.fsync(sf.fileno())
             holder.set()
             release.wait(timeout=15)      # 长持锁：事务块处于写入中
             f.write(tail)
             f.flush()
             os.fsync(f.fileno())
+            with open(walib.SHADOW_PATH, "ab") as sf:
+                sf.write(tail)
+                sf.flush()
+                os.fsync(sf.fileno())
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
@@ -800,9 +857,9 @@ truth.refresh()
 walib.cmp_summary(ledger()[0], truth.summary(), "3d after writer released", fails)
 
 # ---------- 3e. 压缩重写与并发重叠：每个响应必须精确等于旧态或新态 ----------
-truth_before = walib.Truth(JOURNAL)
+truth_before = walib.Truth(walib.SHADOW_PATH)
 truth_before.full()
-writer = walib.Writer(JOURNAL, truth_before.last_seq)
+writer = walib.Writer(JOURNAL, truth_before.last_seq, shadow=walib.SHADOW_PATH)
 old_expected = truth_before.summary()
 
 def compactor():
@@ -818,7 +875,7 @@ with cf.ThreadPoolExecutor(max_workers=20) as ex:
     futs = [ex.submit(lambda: ledger(timeout=40)) for _ in range(20)]
     results = [f.result() for f in futs]
 sw.join(timeout=60)
-truth_after = walib.Truth(JOURNAL)
+truth_after = walib.Truth(walib.SHADOW_PATH)
 truth_after.full()
 new_expected = truth_after.summary()
 for g, _e, _h, _b in results:

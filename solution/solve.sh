@@ -235,12 +235,14 @@ class Svc(object):
         self.path = os.path.join(data_dir, JOURNAL_NAME)
         self.lock = threading.RLock()
         self.ino = None
+        self.mtime_ns = None           # 变更检测第三元：同 inode 同大小的原位改写
         self.offset = 0
         self.tail = b""                # 未完成的最后一行（写入端停顿期间）
         self.ledger = Ledger()
 
     def _rebuild(self, st, f):
         self.ino = st.st_ino
+        self.mtime_ns = st.st_mtime_ns
         self.tail = b""
         self.ledger = Ledger()
         f.seek(0)
@@ -273,15 +275,16 @@ class Svc(object):
         try:
             st = os.stat(self.path)
         except OSError:
-            return
-        if self.ino is not None and st.st_ino == self.ino and st.st_size == self.offset \
+            raise                      # 数据面 I/O 故障不得静默退回旧快照
+        if self.ino is not None and st.st_ino == self.ino \
+                and st.st_size == self.offset and st.st_mtime_ns == self.mtime_ns \
                 and not self.tail:
             return
         f = None
         try:
             f = open(self.path, "rb")
         except OSError:
-            return
+            raise                      # 同上：I/O 故障向上传播（HTTP 503）
         try:
             deadline = time.monotonic() + LOCK_WAIT_SEC
             while True:
@@ -299,10 +302,13 @@ class Svc(object):
             if st.st_size < self.offset:
                 self._rebuild(st, f)            # 就地截断：重建
                 return
-            if st.st_size == self.offset and not self.tail:
-                return
+            if st.st_size == self.offset:
+                if st.st_mtime_ns != self.mtime_ns:
+                    self._rebuild(st, f)   # 同 inode 同大小但内容被原位改写：重建
+                return                     # 无新数据（或停顿中等待尾巴行）
             f.seek(self.offset)
             self._ingest_stream(f, self.offset)
+            self.mtime_ns = st.st_mtime_ns
         finally:
             try:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
@@ -341,7 +347,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/v1/ledger":
             with SVC.lock:
-                SVC.refresh()
+                try:
+                    SVC.refresh()
+                except OSError:
+                    self._send(503, b"", send_body)
+                    return
                 data = SVC.ledger.summary()
             self._json(data, send_body)
             return
@@ -351,7 +361,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"error": "missing name"}, send_body, 400)
                 return
             with SVC.lock:
-                SVC.refresh()
+                try:
+                    SVC.refresh()
+                except OSError:
+                    self._send(503, b"", send_body)
+                    return
                 bal = SVC.ledger.balances
                 if raw not in bal:
                     self._send(404, b"", send_body)
@@ -391,6 +405,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(405, b"", True, {"Allow": "GET, HEAD"})
 
     def do_PATCH(self):
+        self._send(405, b"", True, {"Allow": "GET, HEAD"})
+    def do_TRACE(self):
+        self._send(405, b"", True, {"Allow": "GET, HEAD"})
+
+    def do_CONNECT(self):
         self._send(405, b"", True, {"Allow": "GET, HEAD"})
 
     def log_message(self, fmt, *args):

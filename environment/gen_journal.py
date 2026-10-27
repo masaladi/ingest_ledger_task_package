@@ -152,7 +152,7 @@ def gen():
         '{"seq":25,"op":"BEGIN","tx":507}',
         '{"seq":26,"op":"PUT","tx":507,"key":"acct-0011","delta":40}',
         '{"seq":27,"op":"COMMIT","tx":507}',
-        '{"seq":28,"op":"CKPT","committed_records":9,"committed_txns":6,'
+        '{"seq":28,"op":"CKPT","committed_records":10,"committed_txns":6,'
         '"balances":{"acct-0002":80,"acct-0004":90,"acct-0005":70,'
         '"acct-0008":-15,"acct-0009":60,"acct-0011":40}}',
         '{"seq":29,"op":"BEGIN","tx":508}',
@@ -185,10 +185,10 @@ def gen():
         {"line": 18, "note": "事务 505 提交，2 条数据记录计入"},
         {"line": 19, "note": "事务 506 开始"},
         {"line": 20, "note": "acct-0005 += 70"},
-        {"line": 21, "note": "PUT 缺 delta：该行非法，静默过滤"},
+        {"line": 21, "note": "PUT 缺 delta：按 0 计入，该行仍生效（acct-0005 += 0）"},
         {"line": 22, "note": "delta 为布尔值：该行非法，静默过滤"},
         {"line": 23, "note": "delta 为负数：正常累加，acct-0008 = -15"},
-        {"line": 24, "note": "事务 506 提交，2 条数据记录计入"},
+        {"line": 24, "note": "事务 506 提交，3 条数据记录计入（70 / 0 / -15）"},
         {"line": 25, "note": "孤立 COMMIT（无对应 BEGIN）：该行非法，静默过滤"},
         {"line": 26, "note": "事务 507 开始"},
         {"line": 27, "note": "acct-0011 += 40"},

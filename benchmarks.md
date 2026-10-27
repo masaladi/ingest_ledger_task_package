@@ -54,3 +54,8 @@ PY
   records=7,976,106（=7,976,143 - 37 条 no-op DEL），txns/keys/total/top_keys 不变；
   本地差分对拍 Truth vs oracle Ledger 逐字段一致。题面异常表删除该行、records
   定义去掉「有效」与「PUT 与 DEL」枚举，恢复无先验口径歧义轴。
+
+- 2026-10-27 v3（R2 整改：防篡改真值基线 / mtime 检测 / 样本对齐 / 依赖锁版本，
+  镜像重建 ingest-ledger:selfcheck）：precheck OK（15 文件）；NOP reward=0.00；
+  Oracle reward=1.00（warmup 13.49s，records=7,976,106）。回归工具入口
+  `scripts/selfcheck.sh`（预检 → 构建 → NOP → Oracle 一键四关）。
