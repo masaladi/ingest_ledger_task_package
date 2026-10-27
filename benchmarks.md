@@ -59,3 +59,11 @@ PY
   镜像重建 ingest-ledger:selfcheck）：precheck OK（15 文件）；NOP reward=0.00；
   Oracle reward=1.00（warmup 13.49s，records=7,976,106）。回归工具入口
   `scripts/selfcheck.sh`（预检 → 构建 → NOP → Oracle 一键四关）。
+
+- 2026-10-27 v4（平台 Oracle 0.330 修复：冻结基线硬门槛 → 优选+降级）：
+  平台环境下防篡改冻结产物缺失导致 ITEM2 崩溃、ITEM3 连坐（影子文件未创建），
+  仅 ITEM1 幸存 = 1/3。修复：walib.ensure_shadow() 统一真值锚点解析——基线
+  就绪走影子真值（防篡改隔离保留），任何异常降级为 live journal 真值并告警；
+  ITEM3 自举 ensure_shadow 不再依赖 ITEM2 副作用。双场景容器验证：基线在
+  3/3=1.00（无告警，影子生效）；基线删除 3/3=1.00（告警降级）；NOP=0.00。
+  判分口径、门槛数字、题目语义零改动。

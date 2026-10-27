@@ -42,7 +42,8 @@
 - **容器停止**：占位进程收到 SIGTERM 后让出 9410 端口并转为无监听保活镜像；
   保活镜像再次收到终止信号即正常退出，`docker stop` 可优雅完成。
 - **防篡改基线**：容器启动时 journal 被冻结为只读副本与 SHA-256 摘要（见
-  `docs/scoring-rationale.md` §3b），评测真值与该基线解耦于可写的 live 文件。
+  `docs/scoring-rationale.md` §3b），评测真值与该基线解耦于可写的 live 文件；
+  基线不可用时评测自动降级为 live journal 真值并告警，不影响可用性。
 - **一键回归**：`bash scripts/selfcheck.sh` 依次执行预检 → 构建 → NOP →
   Oracle 四关，输出各关判定。
 
