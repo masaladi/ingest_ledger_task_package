@@ -46,7 +46,8 @@ MUST_ALIGN = {
 
 # 不允许出现的过期数字与旧任务残留（历次迭代清查）
 STALE_NUMBERS = ["9090", "9310", "log-aggregator", "telemetry-svc", "855 万",
-                 "880 MB", "900 万行", "970 万行", "24 秒", "24s"]
+                 "880 MB", "900 万行", "970 万行", "24 秒", "24s",
+                 "truth_journal.jsonl"]   # v6 起影子流路径随机化，旧固定路径不得残留
 
 
 def read(path):

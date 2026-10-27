@@ -18,6 +18,10 @@ TOTAL=3
 
 export DATA_DIR JOURNAL BASE VENV_PY APP_PY
 
+# 影子真值流路径每次评测随机生成：考生无法预知路径，预置伪造文件无从谈起
+SHADOW_PATH="/tmp/.truth_$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+export SHADOW_PATH
+
 # 备份 journal，退出时还原（题面口径：服务必须始终等价于对当前文件从头重放）
 rm -f /tmp/journal.bak
 cp -a "$JOURNAL" /tmp/journal.bak 2>/dev/null || true
@@ -41,17 +45,17 @@ import json as _sj                 # 序列化用（ujson.dumps 不支持 separa
 
 BASE = os.environ["BASE"]
 
-# 防篡改真值基线：容器启动时由现场进程冻结的 journal 只读副本与摘要。
-# 真值重放一律以"该基线 + 评测端追加（影子流）"为准，与服务/考生可写的
-# live journal 解耦，杜绝"改写 journal 让服务自证正确"的环形作弊。
+# 防篡改真值基线：镜像构建期冻结的 journal 只读副本与摘要（随镜像层分发的
+# 构建产物）。真值重放一律以"该基线 + 评测端追加（影子流）"为准，与服务/考生
+# 可写的 live journal 解耦，杜绝"改写 journal 让服务自证正确"的环形作弊。
+# 影子流路径由评测入口随机生成并经环境变量传入（SHADOW_PATH），每次评测不同。
 PRISTINE_PATH = "/opt/ingest-ledger/.journal.pristine"
 DIGEST_PATH = "/opt/ingest-ledger/.journal.sha256"
-SHADOW_PATH = "/tmp/truth_journal.jsonl"
+SHADOW_PATH = os.environ["SHADOW_PATH"]
 SHADOW_ON = False                # 影子真值是否启用（冻结基线就绪时为 True）
-TRUTH_PATH = None                # 真值锚点：影子流或 live journal（由 ensure_shadow 决定）
+TRUTH_PATH = None                # 真值锚点：影子真值流（由 ensure_shadow 决定）
 # 烧录进判分脚本的 journal 构建期摘要（gen_journal 固定种子，跨平台构建一致）。
-# 基线文件缺失时，live journal 只有与本摘要一致才允许作为降级真值锚点——
-# 降级路径不绕过改写检测。
+# 基线文件与摘要文件即使被同时改写，也会与烧录值冲突而被拦截。
 EXPECTED_JOURNAL_SHA256 = "7aae648c8c389f6b5783eadb16192235f39cc3808d4057ea8e6fbd8d2835bdbc"
 EXPECTED_JOURNAL_SIZE = 636039414       # 构建期基线字节数（追加使文件变长，历史前缀不变）
 
@@ -87,51 +91,37 @@ def _digest_of(path, limit=None):
 
 
 def ensure_shadow():
-    """真值锚点解析（可用性与防篡改并行）：
+    """真值锚点解析（防篡改，无降级路径）：
 
-    1) 构建期冻结基线在且摘要（含烧录常量）相符 → 影子真值流，防篡改隔离；
-    2) 基线两文件只存其一，或摘要与烧录常量不符 → 被改写，评测硬失败；
-    3) 基线整体缺失（异常容器环境）→ live journal 必须满足"不短于基线、
-       且历史前缀摘要与烧录常量一致"（评测端自身的追加只增长文件、不改
-       历史前缀），否则视为数据被改写，评测硬失败。降级路径不绕过改写检测。"""
+    构建期冻结基线（.journal.pristine + .journal.sha256，随镜像层分发的构建
+    产物）在且摘要（文件摘要与烧录常量双重）相符 → 复制为本次评测专属的
+    随机路径影子真值流（0600），此后真值只重放影子流。
+    基线缺失、只存其一或任一摘要不符 → 一律评测硬失败。真值永不回退到考生
+    可写的 live journal，不存在"改写数据文件同时充当仿真与真值"的通道。"""
     global SHADOW_ON, TRUTH_PATH
     import shutil
-    have_pristine = os.path.exists(PRISTINE_PATH)
-    have_digest = os.path.exists(DIGEST_PATH)
-    if have_pristine and have_digest:
-        with open(DIGEST_PATH) as f:
-            want = f.read().split()[0]
-        if _digest_of(PRISTINE_PATH) != want or want != EXPECTED_JOURNAL_SHA256:
+    if not (os.path.exists(PRISTINE_PATH) and os.path.exists(DIGEST_PATH)):
+        raise RuntimeError(
+            "frozen truth baseline missing (build-time artifacts "
+            ".journal.pristine / .journal.sha256 not both present): "
+            "evaluation environment broken (hard fail)")
+    with open(DIGEST_PATH) as f:
+        want = f.read().split()[0]
+    if _digest_of(PRISTINE_PATH) != want or want != EXPECTED_JOURNAL_SHA256:
+        raise RuntimeError(
+            "pristine baseline digest mismatch: baseline tampered (hard fail)")
+    if os.path.exists(SHADOW_PATH):
+        # 影子流已存在（同一次评测的前序大项创建）：前缀必须与烧录摘要
+        # 一致（基线 + 追加），预置伪造文件在此被拦截
+        if os.stat(SHADOW_PATH).st_size < EXPECTED_JOURNAL_SIZE or \
+                _digest_of(SHADOW_PATH, EXPECTED_JOURNAL_SIZE) != EXPECTED_JOURNAL_SHA256:
             raise RuntimeError(
-                "pristine baseline digest mismatch: baseline tampered (hard fail)")
-        if os.path.exists(SHADOW_PATH):
-            # 影子流已存在（同一次评测的前序大项创建）：前缀必须与烧录摘要
-            # 一致（基线 + 追加），预置伪造文件在此被拦截
-            if os.stat(SHADOW_PATH).st_size < EXPECTED_JOURNAL_SIZE or \
-                    _digest_of(SHADOW_PATH, EXPECTED_JOURNAL_SIZE) != EXPECTED_JOURNAL_SHA256:
-                raise RuntimeError(
-                    "shadow truth stream prefix mismatch (hard fail)")
-        else:
-            shutil.copyfile(PRISTINE_PATH, SHADOW_PATH)
-        SHADOW_ON = True
-        TRUTH_PATH = SHADOW_PATH
-        return TRUTH_PATH
-    if have_pristine or have_digest:
-        # 只剩一半（人为删除其一）→ 视为篡改环境，硬失败
-        raise RuntimeError(
-            "pristine baseline incomplete (exactly one of copy/digest present): "
-            "evaluation environment tampered (hard fail)")
-    # 基线整体缺失：journal 不得短于基线，且历史前缀必须与烧录摘要一致
-    size = os.stat(JOURNAL).st_size
-    if size < EXPECTED_JOURNAL_SIZE or _digest_of(JOURNAL, EXPECTED_JOURNAL_SIZE) \
-            != EXPECTED_JOURNAL_SHA256:
-        raise RuntimeError(
-            "journal prefix digest mismatch: data tampered while baseline "
-            "missing (hard fail)")
-    print("[walib] baseline missing; journal prefix matches burned-in digest; "
-          "truth anchored to live journal (degraded)", file=sys.stderr)
-    SHADOW_ON = False
-    TRUTH_PATH = JOURNAL
+                "shadow truth stream prefix mismatch (hard fail)")
+    else:
+        shutil.copyfile(PRISTINE_PATH, SHADOW_PATH)
+        os.chmod(SHADOW_PATH, 0o600)
+    SHADOW_ON = True
+    TRUTH_PATH = SHADOW_PATH
     return TRUTH_PATH
 
 
@@ -482,6 +472,16 @@ except Exception:
     fails.append("/healthz body not json: %r" % body[:120])
 hz_len = len(body)
 
+# 协议契约：Content-Length 必须正确，不得使用 chunked 编码
+try:
+    if int(h.get("Content-Length") or -1) != hz_len:
+        fails.append("/healthz Content-Length=%r (want %d)"
+                     % (h.get("Content-Length"), hz_len))
+except ValueError:
+    fails.append("/healthz Content-Length not numeric")
+if "chunked" in (h.get("Transfer-Encoding") or "").lower():
+    fails.append("/healthz uses chunked encoding (forbidden)")
+
 # --- /api/v1/ledger 结构与紧凑输出 ---
 code, h, body, _ = walib.get("/api/v1/ledger", timeout=30)
 if code != 200:
@@ -513,6 +513,22 @@ try:
             fails.append("ledger body is not compact JSON (no spaces allowed)")
 except Exception:
     fails.append("ledger body not json: %r" % body[:120])
+
+# 协议契约：Content-Length 正确且不得 chunked
+try:
+    if int(h.get("Content-Length") or -1) != len(body):
+        fails.append("ledger Content-Length=%r (want %d)"
+                     % (h.get("Content-Length"), len(body)))
+except ValueError:
+    fails.append("ledger Content-Length not numeric")
+if "chunked" in (h.get("Transfer-Encoding") or "").lower():
+    fails.append("ledger uses chunked encoding (forbidden)")
+
+# 协议契约：查询字符串不参与路由
+code, h, _b, _ = walib.get("/api/v1/ledger?brief=1", timeout=30)
+if code != 200:
+    fails.append("/api/v1/ledger?brief=1 status=%s (query string must not "
+                 "affect routing)" % code)
 
 # --- /api/v1/key 结构 ---
 code, h, body, _ = walib.get("/api/v1/key?name=acct-0000", timeout=10)
@@ -572,7 +588,8 @@ except ValueError:
     fails.append("HEAD /healthz Content-Length not numeric")
 
 import urllib.request
-for method in ("POST", "PUT", "DELETE", "OPTIONS", "PATCH"):
+for method in ("POST", "PUT", "DELETE", "OPTIONS", "PATCH",
+               "TRACE", "CONNECT", "PROPFIND"):   # 含未逐一列举的扩展方法
     try:
         req = urllib.request.Request(BASE + "/api/v1/ledger", data=b"", method=method)
         resp = urllib.request.urlopen(req, timeout=10)
@@ -698,8 +715,8 @@ if warm == "FAIL":
 elif float(warm) > walib.WARMUP_SLA:
     fails.append("2a first request %.2fs > %.1fs SLA (full replay of ~9.5M lines "
                  "must fit the 20s budget)" % (float(warm), walib.WARMUP_SLA))
-# 防篡改基线：真值优选容器启动时冻结的只读副本重放，与 live journal 解耦；
-# 基线不可用时自动降级为 live journal（见 walib.ensure_shadow）
+# 防篡改基线：真值以容器镜像构建期冻结的只读副本 + 评测端追加（影子流）重放，
+# 与 live journal 解耦；基线缺失或摘要不符即评测硬失败（见 walib.ensure_shadow）
 truth_path = walib.ensure_shadow()
 t0 = time.monotonic()
 truth = walib.Truth(truth_path)
@@ -798,8 +815,54 @@ try:
 except Exception as e:
     fails.append("2g query failed: %s" % e)
 
+# ---------- 2g2. 解析边界补充：meta 隔离 / 缺失 delta / 非法字段 / 孤立边界行 ----------
+tx = 724007
+lines = [{"op": "BEGIN", "tx": tx},
+         {"op": "PUT", "tx": tx, "key": "acct-0300", "delta": 640,
+          "meta": {"op": "DEL", "key": "acct-0300", "delta": -99999}},
+         {"op": "PUT", "tx": tx, "key": "acct-0301"},              # 缺 delta：按 0 计入
+         {"op": "PUT", "tx": tx, "delta": 50},                     # 缺 key：非法
+         {"op": "PUT", "tx": tx, "key": 42, "delta": 50},          # key 非字符串：非法
+         {"op": "DEL", "tx": tx},                                  # 缺 key：非法
+         {"op": "COMMIT", "tx": tx}]
+writer.emit(lines)
+truth.refresh()
+want = truth.summary()
+try:
+    walib.cmp_summary(ledger_now(), want, "2g2 after meta/missing-delta block",
+                      fails)
+except Exception as e:
+    fails.append("2g2 query failed: %s" % e)
+
+# 空行 / 非 JSON / 非对象 JSON / 缺 seq / seq 为布尔 / 孤立 ABORT 与 COMMIT（无 BEGIN）
+writer.emit_raw(["", "not-json-at-all", '["not","an","object"]',
+                 '{"op":"PUT","tx":%d,"key":"acct-0302","delta":7}' % tx,
+                 '{"seq":true,"op":"PUT","tx":%d,"key":"acct-0303","delta":7}' % tx,
+                 '{"seq":%d,"op":"ABORT","tx":%d}' % (writer.seq + 1, tx),
+                 '{"seq":%d,"op":"COMMIT","tx":%d}' % (writer.seq + 2, tx)])
+writer.seq += 2
+truth.refresh()
+want = truth.summary()
+try:
+    walib.cmp_summary(ledger_now(), want,
+                      "2g2 after malformed/lonely boundary lines", fails)
+except Exception as e:
+    fails.append("2g2 malformed query failed: %s" % e)
+
+# 无效果 DEL：作用于当前不在账本中的 key（acct-0000 已被 2f 移除；幽灵 key 从未
+# 存在）。行合法、seq 正常消费，但不改变账本、不计入 records（样本标注口径：
+# journal_sample.decoded.json 的无效果墓碑演示行）。
+tx = 724008
+writer.emit(walib.txn_block(tx, [], dels=["acct-0000", "ghost-key-never-existed"]))
+truth.refresh()
+want = truth.summary()
+try:
+    walib.cmp_summary(ledger_now(), want, "2g2 after no-op tombstones", fails)
+except Exception as e:
+    fails.append("2g2 no-op del query failed: %s" % e)
+
 # ---------- 2h. /api/v1/key 单 key 查询 ----------
-for key in ("acct-0200", "acct-0201", "acct-0100"):
+for key in ("acct-0200", "acct-0201", "acct-0100", "acct-0300", "acct-0301"):
     want_k = {"name": key, "balance": truth.bal.get(key, 0),
               "last_seq": truth.touched.get(key, 0)}
     if key not in truth.bal:

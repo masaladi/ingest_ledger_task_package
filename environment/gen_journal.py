@@ -122,7 +122,7 @@ def gen():
             emit(put_line(0, tx, rnd.choice(KEYS), rnd.randint(-50000, 50000)))
         flush()
 
-    # ---- 语义自证样本（33 行，覆盖全部记录类型与异常形态） ----
+    # ---- 语义自证样本（37 行，覆盖全部记录类型与异常形态，含无效果墓碑口径演示） ----
     sample = [
         '{"seq":1,"op":"BEGIN","tx":501}',
         '{"seq":2,"op":"PUT","tx":501,"key":"acct-0007","delta":120}',
@@ -159,6 +159,10 @@ def gen():
         '{"seq":30,"op":"PUT","tx":508,"key":"acct-0012","delta":500}',
         '{"seq":30,"op":"PUT","tx":508,"key":"acct-0012","delta":500}',
         '{"seq":31,"op":"COMMIT","tx":508}',
+        '{"seq":32,"op":"BEGIN","tx":509}',
+        '{"seq":33,"op":"DEL","tx":509,"key":"acct-0007"}',
+        '{"seq":34,"op":"DEL","tx":509,"key":"acct-0777"}',
+        '{"seq":35,"op":"COMMIT","tx":509}',
     ]
     with open(os.path.join(SAMPLE_DIR, "journal_sample.jsonl"), "w",
               encoding="utf-8", newline="\n") as f:
@@ -199,6 +203,15 @@ def gen():
         {"line": 31, "note": "acct-0012 += 500"},
         {"line": 32, "note": "写入端重试：seq 30 紧邻重复，只计一次"},
         {"line": 33, "note": "事务 508 提交，acct-0012 = 500（1 条数据记录）"},
+        {"line": 34, "note": "事务 509 开始"},
+        {"line": 35, "note": "无效果 DEL：acct-0007 已在 seq 16 被墓碑移除，不在此"
+                             "账本中。该行合法、被正常消费（seq 推进、事务正常"
+                             "提交），但不产生任何效果——不改变账本、不计入有效"
+                             "数据记录（与 CKPT 的 committed_records 同口径），"
+                             "该 key 的 last_seq 也不更新"},
+        {"line": 36, "note": "无效果 DEL：acct-0777 从未出现在账本中，口径同上行"
+                             "——行合法但无效果，不计入有效数据记录"},
+        {"line": 37, "note": "事务 509 提交：块内两条 DEL 均无效果，0 条数据记录计入"},
     ]
     with open(os.path.join(SAMPLE_DIR, "journal_sample.decoded.json"), "w",
               encoding="utf-8", newline="\n") as f:
