@@ -38,7 +38,7 @@ FORBIDDEN_PATTERNS = [
 # 三方（题面/README/判分口径文档）必须同时出现的数字与口径
 MUST_ALIGN = {
     "instruction.md": ["20 秒", "1.5 秒", "30 秒", "2 秒", "800 万", "950 万行",
-                       "9410", "fcntl.flock"],
+                       "9410", "fcntl.flock", "503", "写入中", "扩展方法"],
     "README.md": ["1.5 秒", "20 秒", "30 秒", "800 万", "950 万行", "9410",
                   "benchmarks.md"],
     "benchmarks.md": ["20s", "1.5s", "30s", "800 万", "950 万行"],

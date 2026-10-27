@@ -43,6 +43,11 @@ RUN mkdir -p /var/lib/ingest-ledger /opt/ingest-ledger/samples \
     && python3 /opt/gen_journal.py \
     && rm -f /opt/gen_journal.py
 
+# 构建期冻结防篡改真值基线：随镜像层存在，不依赖运行期 entrypoint
+# （评测环境可能以自定义命令覆盖启动，运行期冻结在该场景下不会发生）。
+RUN cp /var/lib/ingest-ledger/journal.jsonl /opt/ingest-ledger/.journal.pristine \
+    && sha256sum /opt/ingest-ledger/.journal.pristine > /opt/ingest-ledger/.journal.sha256
+
 # 上一任留下的权限现场：数据目录不可进入、journal 不可读、日志目录不可写。
 # 服务以 ledgersvc 运行时读不到数据文件，也写不出日志。
 RUN mkdir -p /var/log/ingest-ledger \

@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# 异常路径清理：答题未成功（启动失败/中途出错）时回收本次拉起的后台服务，
+# 不遗留孤儿进程；服务成功就绪后解除 trap（服务必须存活供评测使用）。
+cleanup_on_error() {
+    pkill -f "/opt/ingest-ledger/app.py" 2>/dev/null || true
+}
+trap cleanup_on_error INT TERM ERR
+
 # 1. 清理 9410 端口上的遗留占位进程与残留服务
 #    容器内没有 CAP_SYS_PTRACE，fuser 读不到别人的 /proc/PID/fd，
 #    以 /proc/PID/cmdline 匹配为准（root 可读）。
@@ -412,6 +419,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self):
         self._send(405, b"", True, {"Allow": "GET, HEAD"})
 
+    def __getattr__(self, name):
+        # 协议规范：任意非 GET/HEAD 方法（含未枚举的扩展方法）一律 405。
+        # BaseHTTPRequestHandler 对未实现方法默认 501，此处兜底统一改判 405。
+        if name.startswith("do_"):
+            def _method_not_allowed():
+                self._drain()
+                self._send(405, b"", True, {"Allow": "GET, HEAD"})
+            return _method_not_allowed
+        raise AttributeError(name)
+
     def log_message(self, fmt, *args):
         return
 
@@ -420,7 +437,13 @@ def main():
     global SVC
     port, data_dir = load_config()
     SVC = Svc(data_dir)
-    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    class _Srv(http.server.ThreadingHTTPServer):
+        # 默认 listen backlog=5：20 并发瞬时建连会在 SYN 队列排队，
+        # 个别连接延迟可达 2s+，扩容 backlog 消除建连毛刺
+        request_queue_size = 128
+        daemon_threads = True
+
+    httpd = _Srv(("0.0.0.0", port), Handler)
     httpd.daemon_threads = True
     httpd.serve_forever()
 
@@ -466,6 +489,8 @@ rm -f /tmp/_healthcheck.py
 if ! $ready; then
     echo "[solve] ERROR: service did not answer /healthz on 9410 within 30s" >&2
     tail -20 /var/log/ingest-ledger/app.log >&2 || true
+    cleanup_on_error
     exit 1
 fi
+trap - INT TERM ERR
 echo "[solve] service is up on 9410"

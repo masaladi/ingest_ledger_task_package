@@ -41,11 +41,25 @@
   `docker logs` 可直接观测；服务不落本地日志文件。
 - **容器停止**：占位进程收到 SIGTERM 后让出 9410 端口并转为无监听保活镜像；
   保活镜像再次收到终止信号即正常退出，`docker stop` 可优雅完成。
-- **防篡改基线**：容器启动时 journal 被冻结为只读副本与 SHA-256 摘要（见
-  `docs/scoring-rationale.md` §3b），评测真值与该基线解耦于可写的 live 文件；
-  基线不可用时评测自动降级为 live journal 真值并告警，不影响可用性。
+- **防篡改基线**：journal 在**镜像构建期**被冻结为只读副本与 SHA-256 摘要
+  （见 `docs/scoring-rationale.md` §3b），不依赖运行期 entrypoint；评测真值
+  与该基线解耦于可写的 live 文件，判分脚本另烧录一份摘要常量交叉校验。基线
+  缺失且 live journal 与烧录摘要一致时评测降级并告警；任何改写检测命中即
+  硬失败。
 - **一键回归**：`bash scripts/selfcheck.sh` 依次执行预检 → 构建 → NOP →
   Oracle 四关，输出各关判定。
+
+## 发布链路与回滚
+
+- **发布步骤**：①`python precheck.py` 静态自检；②`bash scripts/selfcheck.sh`
+  四关回归（预检 → 构建 → NOP → Oracle）；③对照 `benchmarks.md` 回归记录
+  核对本次镜像的 journal SHA-256 摘要与各门槛实测值；④提交前冻结 git HEAD
+  短哈希与 journal 摘要写入回归记录。
+- **回滚步骤**：任一关卡失败即停止发布；回退到上一个通过全部关卡的 git
+  提交并重建镜像（数据生成器固定种子，重建后 journal 摘要应与回归记录一致，
+  不一致说明环境漂移，先排查再发布）。
+- **CI 入口**：`scripts/selfcheck.sh` 即最小 CI 流水线，可在任何 Linux
+  runner 上直接执行，无需额外参数。
 
 ## 发布前回归清单（送测前）
 

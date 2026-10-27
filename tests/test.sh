@@ -49,6 +49,11 @@ DIGEST_PATH = "/opt/ingest-ledger/.journal.sha256"
 SHADOW_PATH = "/tmp/truth_journal.jsonl"
 SHADOW_ON = False                # 影子真值是否启用（冻结基线就绪时为 True）
 TRUTH_PATH = None                # 真值锚点：影子流或 live journal（由 ensure_shadow 决定）
+# 烧录进判分脚本的 journal 构建期摘要（gen_journal 固定种子，跨平台构建一致）。
+# 基线文件缺失时，live journal 只有与本摘要一致才允许作为降级真值锚点——
+# 降级路径不绕过改写检测。
+EXPECTED_JOURNAL_SHA256 = "7aae648c8c389f6b5783eadb16192235f39cc3808d4057ea8e6fbd8d2835bdbc"
+EXPECTED_JOURNAL_SIZE = 636039414       # 构建期基线字节数（追加使文件变长，历史前缀不变）
 
 
 def verify_pristine():
@@ -64,31 +69,69 @@ def verify_pristine():
         raise RuntimeError("pristine journal digest mismatch (baseline tampered)")
 
 
+def _digest_of(path, limit=None):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        if limit is None:
+            for chunk in iter(lambda: f.read(8 << 20), b""):
+                h.update(chunk)
+        else:
+            remaining = limit
+            for chunk in iter(lambda: f.read(min(8 << 20, remaining)), b""):
+                h.update(chunk)
+                remaining -= len(chunk)
+                if remaining <= 0:
+                    break
+    return h.hexdigest()
+
+
 def ensure_shadow():
-    """真值锚点解析：优选容器启动时冻结的防篡改基线（影子真值流）；基线缺失、
-    摘要不符或副本失败时降级为 live journal 真值并告警，保证评测在任意容器
-    环境下可用。防篡改隔离是增强项而非硬门槛。"""
+    """真值锚点解析（可用性与防篡改并行）：
+
+    1) 构建期冻结基线在且摘要（含烧录常量）相符 → 影子真值流，防篡改隔离；
+    2) 基线两文件只存其一，或摘要与烧录常量不符 → 被改写，评测硬失败；
+    3) 基线整体缺失（异常容器环境）→ live journal 必须满足"不短于基线、
+       且历史前缀摘要与烧录常量一致"（评测端自身的追加只增长文件、不改
+       历史前缀），否则视为数据被改写，评测硬失败。降级路径不绕过改写检测。"""
     global SHADOW_ON, TRUTH_PATH
     import shutil
-    try:
-        verify_pristine()
-    except Exception as e:
-        print("[walib] pristine baseline unavailable (%s); truth anchored to live journal"
-              % e, file=sys.stderr)
-        SHADOW_ON = False
-        TRUTH_PATH = JOURNAL
-        return TRUTH_PATH
-    if not os.path.exists(SHADOW_PATH):
-        try:
+    have_pristine = os.path.exists(PRISTINE_PATH)
+    have_digest = os.path.exists(DIGEST_PATH)
+    if have_pristine and have_digest:
+        with open(DIGEST_PATH) as f:
+            want = f.read().split()[0]
+        if _digest_of(PRISTINE_PATH) != want or want != EXPECTED_JOURNAL_SHA256:
+            raise RuntimeError(
+                "pristine baseline digest mismatch: baseline tampered (hard fail)")
+        if os.path.exists(SHADOW_PATH):
+            # 影子流已存在（同一次评测的前序大项创建）：前缀必须与烧录摘要
+            # 一致（基线 + 追加），预置伪造文件在此被拦截
+            if os.stat(SHADOW_PATH).st_size < EXPECTED_JOURNAL_SIZE or \
+                    _digest_of(SHADOW_PATH, EXPECTED_JOURNAL_SIZE) != EXPECTED_JOURNAL_SHA256:
+                raise RuntimeError(
+                    "shadow truth stream prefix mismatch (hard fail)")
+        else:
             shutil.copyfile(PRISTINE_PATH, SHADOW_PATH)
-        except Exception as e:
-            print("[walib] shadow copy failed (%s); truth anchored to live journal"
-                  % e, file=sys.stderr)
-            SHADOW_ON = False
-            TRUTH_PATH = JOURNAL
-            return TRUTH_PATH
-    SHADOW_ON = True
-    TRUTH_PATH = SHADOW_PATH
+        SHADOW_ON = True
+        TRUTH_PATH = SHADOW_PATH
+        return TRUTH_PATH
+    if have_pristine or have_digest:
+        # 只剩一半（人为删除其一）→ 视为篡改环境，硬失败
+        raise RuntimeError(
+            "pristine baseline incomplete (exactly one of copy/digest present): "
+            "evaluation environment tampered (hard fail)")
+    # 基线整体缺失：journal 不得短于基线，且历史前缀必须与烧录摘要一致
+    size = os.stat(JOURNAL).st_size
+    if size < EXPECTED_JOURNAL_SIZE or _digest_of(JOURNAL, EXPECTED_JOURNAL_SIZE) \
+            != EXPECTED_JOURNAL_SHA256:
+        raise RuntimeError(
+            "journal prefix digest mismatch: data tampered while baseline "
+            "missing (hard fail)")
+    print("[walib] baseline missing; journal prefix matches burned-in digest; "
+          "truth anchored to live journal (degraded)", file=sys.stderr)
+    SHADOW_ON = False
+    TRUTH_PATH = JOURNAL
     return TRUTH_PATH
 
 
@@ -884,16 +927,53 @@ th = threading.Thread(target=long_writer, daemon=True)
 th.start()
 holder.wait(timeout=15)
 time.sleep(0.2)
-got, elapsed, _h, _b = ledger(timeout=6)
-if elapsed > 2.0:
-    fails.append("3d lock contention: %.2fs to respond (must be <= 2.0s)" % elapsed)
-if got != primed:
-    fails.append("3d during long lock hold: response is not the last complete snapshot")
+# 持锁期间服务必须保持响应（不挂起）且精确返回最后一个完整快照：
+# 既不得包含写入中数据，也不得因锁竞争死锁。异常显式计入 fails，不中断评测。
+try:
+    got, elapsed, _h, _b = ledger(timeout=6)
+except Exception as e:
+    fails.append("3d during long lock hold: request failed/timeout (%s) - "
+                 "service must stay responsive under flock contention" % e)
+    got, elapsed = None, None
+if got is not None:
+    if elapsed > 2.0:
+        fails.append("3d lock contention: %.2fs to respond (must be <= 2.0s)" % elapsed)
+    if got != primed:
+        fails.append("3d during long lock hold: response is not the last complete "
+                     "snapshot (pending or partial data leaked into statistics)")
 release.set()
 th.join(timeout=20)
 time.sleep(0.3)
 truth.refresh()
 walib.cmp_summary(ledger()[0], truth.summary(), "3d after writer released", fails)
+
+# ---------- 3f. 数据面故障闭环：journal 暂时不可读 → 503，恢复后自动重建 ----------
+import urllib.request as _ureq
+import urllib.error as _uerr
+offline = JOURNAL + ".offline"
+os.rename(JOURNAL, offline)
+try:
+    try:
+        _r = _ureq.urlopen(walib.BASE + "/api/v1/ledger", timeout=30)
+        fails.append("3f journal offline: expected 503, got %s" % _r.getcode())
+    except _uerr.HTTPError as e:
+        if e.code != 503:
+            fails.append("3f journal offline: expected 503, got %s" % e.code)
+        elif e.headers.get("X-Ledger-Status") != "Verified":
+            fails.append("3f journal offline 503: X-Ledger-Status header missing")
+    except Exception as e:
+        fails.append("3f journal offline: unexpected failure %r (want HTTP 503)" % e)
+finally:
+    os.rename(offline, JOURNAL)
+time.sleep(0.3)
+try:
+    _g, _e, _h, _b = ledger(timeout=60)
+except Exception as e:
+    _g = None
+    fails.append("3f after journal restored: request failed (%s) - service must "
+                 "rebuild automatically once the data file returns" % e)
+if _g is not None:
+    walib.cmp_summary(_g, truth.summary(), "3f after journal restored", fails)
 
 # ---------- 3e. 压缩重写与并发重叠：每个响应必须精确等于旧态或新态 ----------
 truth_before = walib.Truth(walib.TRUTH_PATH)

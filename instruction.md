@@ -83,6 +83,8 @@ JSON 对象。数据团队没有留下格式文档，`samples/` 下的样本与�
 | `PUT` 的 `key` 当前不在账本中 | 作为新 key 建档 |
 | `DEL` 的 `key` 缺失或不是字符串 | 该行非法，静默过滤 |
 | 无 `BEGIN` 的孤立 `COMMIT` / `ABORT` | 该行非法，静默过滤 |
+| 事务块处于写入中（`BEGIN` 与块内数据已落盘、`COMMIT` 未落盘） | 块内数据记录不计入任何统计；`COMMIT` 落盘后按重放顺序生效 |
+| 数据文件暂时不可读（被重命名、轮转等） | `/api/v1/ledger` 与 `/api/v1/key` 返回 `503`（响应头仍含 `X-Ledger-Status: Verified`）；文件恢复后的首个请求自动重建统计状态 |
 | 行内附加 `meta` 子对象 | 不参与任何统计，一律以顶层字段为准 |
 | `CKPT`（压缩检查点） | 重放基线重置为该快照（`balances` / `committed_records` / `committed_txns`），此后从快照继续 |
 | 文件内全部为非法行 | 正常返回 `records=0`、`txns=0`、`keys=0`、`total_balance=0`、`top_keys=[]`，不得报错 |
@@ -133,9 +135,9 @@ JSON**（即 `json.dumps(..., separators=(",", ":"))` 的形式，字段间不�
 
 ### HTTP 方法语义
 
-1. `GET` 与 `HEAD` 之外的任何方法（`POST` / `PUT` / `DELETE` / `OPTIONS` /
-   `PATCH` 等）一律返回 `405`，并携带 `Allow: GET, HEAD`，响应头同样包含
-   `X-Ledger-Status: Verified`。
+1. `GET` 与 `HEAD` 之外的**任何**方法（`POST` / `PUT` / `DELETE` / `OPTIONS` /
+   `PATCH` 及未逐一列举的扩展方法）一律返回 `405`，并携带
+   `Allow: GET, HEAD`，响应头同样包含 `X-Ledger-Status: Verified`。
 2. `HEAD /healthz` 返回 `200`，响应头与 `GET` 一致（含正确的
    `Content-Length`），但**响应体为空**。
 3. **查询字符串不参与路由**：`/healthz?verbose=1` 与 `/healthz` 行为一致。
