@@ -154,9 +154,9 @@ class Truth(object):
                 if self.open_tx is not None:
                     self.pending.append(("DEL", key, None, seq))
                 else:
-                    self.bal.pop(key, None)
-                    self.touched[key] = seq
-                    self.records += 1
+                    if self.bal.pop(key, None) is not None:
+                        self.touched[key] = seq
+                        self.records += 1
             elif op == "BEGIN":
                 self.open_tx = obj.get("tx")
                 self.pending = []
@@ -165,10 +165,11 @@ class Truth(object):
                     for kind, key, delta, s in self.pending:
                         if kind == "PUT":
                             self.bal[key] = self.bal.get(key, 0) + delta
-                        else:
-                            self.bal.pop(key, None)
-                        self.touched[key] = s
-                        self.records += 1
+                            self.touched[key] = s
+                            self.records += 1
+                        elif self.bal.pop(key, None) is not None:
+                            self.touched[key] = s
+                            self.records += 1
                     self.txns += 1
                     self.open_tx = None
                     self.pending = []

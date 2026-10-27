@@ -47,3 +47,10 @@ PY
 - 2026-10-26 v1：镜像 ingest-ledger:v1（约 953.7 万行 / 607MB；已提交数据记录
   7,976,143、事务 724,000、存活 key 4,991、末尾未提交事务 137 条）。precheck OK；
   NOP reward=0.00；Oracle reward=1.00（warmup 12.98s / 13.20s / 13.37s / 14.06s 多轮）。
+
+- 2026-10-27 v2（no-op DEL 轴翻转，仅改判分/题面/参考解，数据与镜像未变）：
+  T1 两连 1.000 归因为题面第 85 行把 no-op DEL 计数口径规范化（第四处同型泄露）。
+  records 真值改为「pop 成功才计数」（无效果 DEL 不计入）：truth/oracle 实测
+  records=7,976,106（=7,976,143 - 37 条 no-op DEL），txns/keys/total/top_keys 不变；
+  本地差分对拍 Truth vs oracle Ledger 逐字段一致。题面异常表删除该行、records
+  定义去掉「有效」与「PUT 与 DEL」枚举，恢复无先验口径歧义轴。

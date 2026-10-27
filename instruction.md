@@ -82,7 +82,6 @@ JSON 对象。数据团队没有留下格式文档，`samples/` 下的样本与�
 | `PUT` 的 `delta` 为负数 | 正常累加 |
 | `PUT` 的 `key` 当前不在账本中 | 作为新 key 建档 |
 | `DEL` 的 `key` 缺失或不是字符串 | 该行非法，静默过滤 |
-| `DEL` 作用于当前不在账本中的 key | 无效果，该行仍计入有效数据记录 |
 | 无 `BEGIN` 的孤立 `COMMIT` / `ABORT` | 该行非法，静默过滤 |
 | 行内附加 `meta` 子对象 | 不参与任何统计，一律以顶层字段为准 |
 | `CKPT`（压缩检查点） | 重放基线重置为该快照（`balances` / `committed_records` / `committed_txns`），此后从快照继续 |
@@ -107,8 +106,8 @@ JSON 对象。数据团队没有留下格式文档，`samples/` 下的样本与�
 JSON**（即 `json.dumps(..., separators=(",", ":"))` 的形式，字段间不含空格），
 包含以下字段：
 
-- `records`：整数，等于对当前 journal 从头重放后计入的有效数据记录数
-  （`PUT` 与 `DEL`，重试行只计一次）
+- `records`：整数，等于对当前 journal 从头重放后计入的数据记录数
+  （重试行只计一次）
 - `txns`：整数，等于对当前 journal 从头重放后计入的事务块数
 - `keys`：整数，等于当前存活 key 的数量
 - `total_balance`：整数，等于全部存活 key 余额之和

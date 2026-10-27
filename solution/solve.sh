@@ -166,9 +166,9 @@ class Ledger(object):
                 if open_tx is not None:
                     pending.append((None, key, seq))
                 else:
-                    balances.pop(key, None)
-                    touched[key] = seq
-                    records += 1
+                    if balances.pop(key, None) is not None:
+                        touched[key] = seq
+                        records += 1
             elif op == "BEGIN":
                 open_tx = obj.get("tx")
                 pending = []
@@ -176,9 +176,9 @@ class Ledger(object):
                 if open_tx is not None:
                     for item in pending:
                         if item[0] is None:
-                            balances.pop(item[1], None)
-                            touched[item[1]] = item[2]
-                            records += 1
+                            if balances.pop(item[1], None) is not None:
+                                touched[item[1]] = item[2]
+                                records += 1
                         else:
                             balances[item[0]] = balances.get(item[0], 0) + item[1]
                             touched[item[0]] = item[2]
